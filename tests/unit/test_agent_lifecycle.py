@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from bernstein.core.agent_reaping import _has_git_commits_on_branch, handle_orphaned_task
@@ -942,6 +943,176 @@ def test_orphaned_task_folds_in_real_runner_cost_from_sidecar(tmp_path: Path) ->
     )
 
     metric_collector_mod._default_collector = None
+
+
+# ---------------------------------------------------------------------------
+# Issue #5844: the ordinary crash/timeout retry path must record a
+# checkpointed-retry reference before the worktree is touched, entered at
+# the real production boundary (not the extracted helper in isolation).
+# ---------------------------------------------------------------------------
+
+
+def _make_checkpoint_worktree(tmp_path: Path) -> Path:
+    tree = tmp_path / "worktree"
+    tree.mkdir()
+    (tree / "main.py").write_text("print('x')\n", encoding="utf-8")
+    return tree
+
+
+def test_handle_dead_agent_writes_retry_checkpoint_before_orphan_handling(tmp_path: Path) -> None:
+    from bernstein.core.agents.agent_lifecycle import _handle_dead_agent
+    from bernstein.core.tasks import checkpoint_retry
+
+    tree = _make_checkpoint_worktree(tmp_path)
+    session = AgentSession(
+        id="agent-crash-1",
+        role="backend",
+        provider="claude",
+        model_config=ModelConfig("claude-3", "high"),
+        task_ids=["T-crash-1"],
+        exit_code=1,
+    )
+
+    orch = SimpleNamespace()
+    orch._spawner = MagicMock()
+    orch._spawner.get_worktree_path.return_value = tree
+    orch._spawner.default_adapter_name = "claude"
+    orch._agent_failure_timestamps = {}
+    orch._crash_counts = {}
+    orch._rate_limit_tracker = None
+    orch._preserved_worktrees = {}
+    orch._signal_mgr = MagicMock()
+    orch._workdir = tmp_path
+
+    with (
+        patch("bernstein.core.agents.agent_lifecycle.transition_agent"),
+        patch("bernstein.core.agents.agent_lifecycle._capture_agent_crash"),
+        patch("bernstein.core.agents.agent_lifecycle._propagate_abort_to_children"),
+        patch("bernstein.core.agents.agent_lifecycle._release_file_ownership"),
+        patch("bernstein.core.agents.agent_lifecycle._release_task_to_session"),
+        patch("bernstein.core.agents.agent_lifecycle._preserve_runner_logs"),
+        patch("bernstein.core.agents.agent_lifecycle._maybe_preserve_worktree"),
+        patch("bernstein.core.agents.agent_lifecycle._handle_orphaned_task_guarded") as mock_orphan,
+        patch("bernstein.core.agents.agent_lifecycle._save_partial_work", return_value=False) as mock_save,
+    ):
+        # The checkpoint must exist by the time either the orphan-handling path
+        # (which reaches retry_or_fail_task) or _save_partial_work (which
+        # touches the worktree with its own WIP commit/merge) run.
+        checkpoint_seen_by_orphan_handler = {}
+
+        def _record_checkpoint_state(*_args, **_kwargs) -> None:
+            checkpoint_seen_by_orphan_handler["ref"] = checkpoint_retry.latest_checkpoint(
+                tmp_path / ".sdd", "T-crash-1"
+            )
+
+        mock_orphan.side_effect = _record_checkpoint_state
+        mock_save.side_effect = lambda *a, **k: checkpoint_seen_by_orphan_handler.setdefault(
+            "still_present_at_save", checkpoint_retry.latest_checkpoint(tmp_path / ".sdd", "T-crash-1") is not None
+        )
+
+        _handle_dead_agent(orch, session, {})
+
+    ref = checkpoint_seen_by_orphan_handler.get("ref")
+    assert ref is not None, "expected a checkpoint to already exist when orphan handling ran"
+    assert ref.session_id == "agent-crash-1"
+    assert ref.adapter == "claude"
+    assert checkpoint_seen_by_orphan_handler.get("still_present_at_save") is True
+
+
+def test_reap_wall_clock_timeout_writes_retry_checkpoint_before_orphan_handling(tmp_path: Path) -> None:
+    from bernstein.core.agents.agent_lifecycle import _reap_wall_clock_timeout
+    from bernstein.core.tasks import checkpoint_retry
+
+    tree = _make_checkpoint_worktree(tmp_path)
+    session = AgentSession(
+        id="agent-wct-1",
+        role="backend",
+        provider="claude",
+        model_config=ModelConfig("claude-3", "high"),
+        task_ids=["T-wct-1"],
+    )
+
+    orch = SimpleNamespace()
+    orch._spawner = MagicMock()
+    orch._spawner.get_worktree_path.return_value = tree
+    orch._spawner.default_adapter_name = "claude"
+    orch._signal_mgr = MagicMock()
+    orch._evolution = None
+    orch._preserved_worktrees = {}
+    orch._workdir = tmp_path
+
+    result = SimpleNamespace(reaped=[])
+
+    seen: dict[str, Any] = {}
+
+    def _record_checkpoint_state(*_args, **_kwargs) -> None:
+        seen["ref"] = checkpoint_retry.latest_checkpoint(tmp_path / ".sdd", "T-wct-1")
+
+    with (
+        patch("bernstein.core.agents.agent_lifecycle._propagate_abort_to_children"),
+        patch("bernstein.core.agents.agent_lifecycle._release_file_ownership"),
+        patch("bernstein.core.agents.agent_lifecycle._release_task_to_session"),
+        patch("bernstein.core.agents.agent_lifecycle._preserve_runner_logs"),
+        patch("bernstein.core.agents.agent_lifecycle.handle_orphaned_task", side_effect=_record_checkpoint_state),
+        patch("bernstein.core.agents.agent_lifecycle._save_partial_work", return_value=False),
+    ):
+        _reap_wall_clock_timeout(orch, session, result, {}, runtime=42.0)
+
+    ref = seen.get("ref")
+    assert ref is not None, "expected a checkpoint to already exist when orphan handling ran"
+    assert ref.session_id == "agent-wct-1"
+    assert ref.adapter == "claude"
+
+
+def test_reap_heartbeat_timeout_writes_retry_checkpoint_before_retry_or_fail_task(tmp_path: Path) -> None:
+    from bernstein.core.agents.agent_lifecycle import _reap_heartbeat_timeout
+    from bernstein.core.tasks import checkpoint_retry
+
+    tree = _make_checkpoint_worktree(tmp_path)
+    session = AgentSession(
+        id="agent-hbt-1",
+        role="backend",
+        provider="claude",
+        model_config=ModelConfig("claude-3", "high"),
+        task_ids=["T-hbt-1"],
+        spawn_ts=1000.0,
+    )
+
+    orch = SimpleNamespace()
+    orch._spawner = MagicMock()
+    orch._spawner.get_worktree_path.return_value = tree
+    orch._spawner.default_adapter_name = "claude"
+    orch._signal_mgr = MagicMock()
+    orch._evolution = None
+    orch._record_provider_health = MagicMock()
+    orch._wal_writer = None
+    orch._client = MagicMock()
+    orch._config = SimpleNamespace(server_url="http://server", max_task_retries=3)
+    orch._retried_task_ids = set()
+    orch._workdir = tmp_path
+
+    result = SimpleNamespace(reaped=[])
+
+    seen: dict[str, Any] = {}
+
+    def _record_checkpoint_state(*_args, **_kwargs) -> None:
+        seen["ref"] = checkpoint_retry.latest_checkpoint(tmp_path / ".sdd", "T-hbt-1")
+
+    with (
+        patch("bernstein.core.agents.agent_lifecycle._propagate_abort_to_children"),
+        patch("bernstein.core.agents.agent_lifecycle._release_file_ownership"),
+        patch("bernstein.core.agents.agent_lifecycle._release_task_to_session"),
+        patch(
+            "bernstein.core.agents.agent_lifecycle.retry_or_fail_task",
+            side_effect=_record_checkpoint_state,
+        ),
+    ):
+        _reap_heartbeat_timeout(orch, session, result, {}, now=1100.0, age=100.0)
+
+    ref = seen.get("ref")
+    assert ref is not None, "expected a checkpoint to already exist when retry_or_fail_task ran"
+    assert ref.session_id == "agent-hbt-1"
+    assert ref.adapter == "claude"
 
 
 def test_reap_wall_clock_timeout_logs_and_continues_when_evolution_raises(tmp_path: Path, caplog) -> None:  # type: ignore[no-untyped-def]
