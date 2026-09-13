@@ -12,3 +12,11 @@ claim was decorative either way.
 verify` rejects a bundle whose signature does not verify, with a new
 `--signer-key` option to pass trusted install-identity public keys
 (mirroring `bench reliability-verify`).
+
+`bench verify` also prints which signer produced the bundle (`signer :
+<fingerprint> (stub - test-grade)` or `(install identity)`), and a
+`--require-install-identity` flag refuses a bundle that only carries a
+valid stub signature. `AgentCardSigner` no longer mints a fresh install
+identity as a side effect of signing: with no keypair on disk it raises,
+pointing at `bernstein init`, instead of silently generating one nobody
+has published.

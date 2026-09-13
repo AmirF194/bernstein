@@ -175,13 +175,20 @@ def bench_run(suite: str, out: str, scheduler: str, stub_signer: bool, reliabili
     help="Trusted Ed25519 public key PEM of the emitting install (repeatable). "
     "The local install identity key is trusted automatically when present.",
 )
-def bench_verify(bundle: str, suite: str, signer_keys: tuple[str, ...]) -> None:
+@click.option(
+    "--require-install-identity",
+    is_flag=True,
+    default=False,
+    help="Refuse a bundle carrying only a stub (test-grade) signature.",
+)
+def bench_verify(bundle: str, suite: str, signer_keys: tuple[str, ...], require_install_identity: bool) -> None:
     """Verify a bundle by replaying every task receipt offline.
 
     BUNDLE is the path to a submission bundle .json file.
 
-    Exits 0 on MATCH, 1 on any divergence, fabricated score, or a signature
-    that does not verify against a trusted key.
+    Exits 0 on MATCH, 1 on any divergence, fabricated score, a signature
+    that does not verify against a trusted key, or (with
+    --require-install-identity) a stub signature.
     """
     from bernstein.eval.bench.bundle import SubmissionBundle
     from bernstein.eval.bench.runner import MockReplayAdapter, ReplayAdapter
@@ -206,6 +213,7 @@ def bench_verify(bundle: str, suite: str, signer_keys: tuple[str, ...]) -> None:
         suite=suite_obj,
         adapter=adapter,
         trusted_keys=_reliability_trusted_keys(signer_keys),
+        require_install_identity=require_install_identity,
     )
     result = verifier.verify(bundle_obj)
 

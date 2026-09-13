@@ -78,6 +78,8 @@ class BundleVerificationResult:
     status: VerificationStatus  # overall verdict
     task_results: list[TaskVerificationResult] = field(default_factory=list)
     detail: str = ""
+    signer_fingerprint: str = ""
+    signer_is_stub: bool = False
 
     @property
     def passed(self) -> bool:
@@ -89,6 +91,9 @@ class BundleVerificationResult:
             f"suite_hash  : {self.suite_hash}",
             f"overall     : {self.status.value}",
         ]
+        if self.signer_fingerprint:
+            kind = "stub, test-grade" if self.signer_is_stub else "install identity"
+            lines.append(f"signer      : {self.signer_fingerprint} ({kind})")
         if self.detail:
             lines.append(f"detail      : {self.detail}")
         lines.append("")
@@ -122,6 +127,11 @@ class BenchVerifier:
     public-key PEM, the same shape ``ReliabilityVerifier`` takes. A
     fingerprint that does not resolve is treated as unsigned rather than
     trusted (see :meth:`_check_signature`).
+
+    A valid stub signature (``StubSigner``) verifies as ``MATCH`` by default,
+    since bench is routinely run test-grade; pass *require_install_identity*
+    to refuse it, e.g. for an admission gate that must reject a bundle that
+    is not tied to a real install identity.
     """
 
     def __init__(
@@ -129,10 +139,13 @@ class BenchVerifier:
         suite: BenchSuite,
         adapter: ReplayAdapter,
         trusted_keys: Mapping[str, bytes] | None = None,
+        *,
+        require_install_identity: bool = False,
     ) -> None:
         self._suite = suite
         self._adapter = adapter
         self._trusted_keys: dict[str, bytes] = dict(trusted_keys or {})
+        self._require_install_identity = require_install_identity
         # Build a task-id → BenchTask index for O(1) lookup.
         self._task_index: dict[str, BenchTask] = {t.id: t for t in suite.tasks}
 
@@ -171,6 +184,7 @@ class BenchVerifier:
             )
 
         # --- 2. Signature check -------------------------------------------
+        is_stub = bundle.signer_fingerprint == StubSigner.fingerprint()
         signature_problem = self._check_signature(bundle)
         if signature_problem:
             return BundleVerificationResult(
@@ -178,6 +192,8 @@ class BenchVerifier:
                 suite_hash=bundle.suite_hash,
                 status=VerificationStatus.UNSIGNED,
                 detail=signature_problem,
+                signer_fingerprint=bundle.signer_fingerprint,
+                signer_is_stub=is_stub,
             )
 
         # --- 3. Per-task verification ------------------------------------
@@ -193,6 +209,8 @@ class BenchVerifier:
             suite_hash=bundle.suite_hash,
             status=overall_status,
             task_results=task_results,
+            signer_fingerprint=bundle.signer_fingerprint,
+            signer_is_stub=is_stub,
         )
 
     # ------------------------------------------------------------------
@@ -206,6 +224,8 @@ class BenchVerifier:
         if bundle.signer_fingerprint == StubSigner.fingerprint():
             if not hmac.compare_digest(bundle.signature, StubSigner.expected_signature(bundle)):
                 return "Stub signature does not verify against the bundle hash."
+            if self._require_install_identity:
+                return "Bundle carries a stub (test-grade) signature; --require-install-identity refuses it."
             return ""
         # Install-identity path: resolve the fingerprint to a trusted public
         # key and verify the detached Ed25519 JWS over the bundle hash.

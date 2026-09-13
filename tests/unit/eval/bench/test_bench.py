@@ -480,6 +480,19 @@ class TestBundleSignatureVerification:
         with pytest.raises(ImportError):
             import bernstein.core.identity.agent_card_signer  # noqa: F401
 
+    def test_agent_card_signer_raises_without_install_identity(
+        self, simple_suite: BenchSuite, adapter: MockReplayAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Signing fails loudly when no key material is available, never silently minted."""
+        from bernstein.core.security.agent_card_keystore import AgentCardKeystore
+
+        empty_keystore = AgentCardKeystore(tmp_path / "keys")
+        assert not empty_keystore.has_keypair()
+        monkeypatch.setattr("bernstein.core.identity.http_signing.default_keystore", lambda: empty_keystore)
+        with pytest.raises(RuntimeError, match="bernstein init"):
+            AgentCardSigner().sign(_make_bundle(simple_suite, adapter))
+        assert not empty_keystore.has_keypair()
+
     def test_agent_card_signer_fingerprint_differs_from_stub(
         self, simple_suite: BenchSuite, adapter: MockReplayAdapter
     ) -> None:
@@ -561,6 +574,35 @@ class TestBundleSignatureVerification:
     def test_agent_card_signer_requires_both_or_neither_key(self) -> None:
         with pytest.raises(ValueError, match="both"):
             AgentCardSigner(private_key_pem=b"x")
+
+    def test_require_install_identity_refuses_valid_stub_signature(
+        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
+    ) -> None:
+        """A stub signature that verifies fine by default is refused under the strict flag."""
+        bundle = StubSigner().sign(_make_bundle(simple_suite, adapter))
+        lenient = BenchVerifier(suite=simple_suite, adapter=adapter)
+        assert lenient.verify(bundle).passed  # guard: still MATCH by default
+
+        strict = BenchVerifier(suite=simple_suite, adapter=adapter, require_install_identity=True)
+        result = strict.verify(bundle)
+        assert result.status == VerificationStatus.UNSIGNED
+        assert "stub" in result.detail.lower()
+
+    def test_report_names_the_signer(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
+        """The verify report says whether a MATCH came from a stub or an install identity."""
+        stub_bundle = StubSigner().sign(_make_bundle(simple_suite, adapter))
+        verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
+        stub_report = verifier.verify(stub_bundle).report()
+        assert f"signer      : {StubSigner.fingerprint()} (stub, test-grade)" in stub_report
+
+        private_pem, public_pem = self._keypair()
+        signer = AgentCardSigner(private_key_pem=private_pem, public_key_pem=public_pem)
+        install_bundle = signer.sign(_make_bundle(simple_suite, adapter))
+        install_verifier = BenchVerifier(
+            suite=simple_suite, adapter=adapter, trusted_keys={signer.fingerprint(): public_pem}
+        )
+        install_report = install_verifier.verify(install_bundle).report()
+        assert f"signer      : {signer.fingerprint()} (install identity)" in install_report
 
 
 # ===========================================================================

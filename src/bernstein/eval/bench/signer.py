@@ -113,7 +113,13 @@ class AgentCardSigner:
             return self._private_key_pem, self._public_key_pem
         from bernstein.core.identity.http_signing import default_keystore
 
-        return default_keystore().load_or_generate()
+        keystore = default_keystore()
+        if not keystore.has_keypair():
+            raise RuntimeError(
+                "No install identity key found; run `bernstein init` first. "
+                "A bench bundle is never signed with a freshly minted, unpublished identity."
+            )
+        return keystore.load_or_generate()
 
     def fingerprint(self) -> str:
         """The install-identity keyid this signer stamps into bundles."""
