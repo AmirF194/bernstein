@@ -336,6 +336,74 @@ def test_write_retry_checkpoint_empty_session_id_downgrades(tmp_path: Path) -> N
     assert metadata["retry_downgrade_reason"] == "no_session_id"
 
 
+def test_write_retry_checkpoint_empty_adapter_downgrades(tmp_path: Path) -> None:
+    """A third trap of the same class as the session-id and hash traps above.
+
+    ``adapter_name_for_provider`` and ``default_adapter_name`` can both miss
+    (an unrecognised provider/model with no configured default), so the
+    checkpoint records ``adapter=""``. ``decide_retry`` treats a falsy
+    adapter as ``CheckpointRetryCapability.NONE``, so this must downgrade
+    with a named reason (``adapter_capability_none``) rather than attempt a
+    resume under an empty adapter name.
+    """
+    tree = _make_worktree(tmp_path)
+    session = _make_session(["task-15"], session_id="sess-15")
+    session.provider = "totally-unrecognised-provider"
+    session.model_config = SimpleNamespace(model="totally-unrecognised-model")
+    orch = _make_orch(tmp_path, tree)
+    orch._spawner.default_adapter_name = None  # both resolution routes miss
+
+    _write_retry_checkpoint(orch, session, detector="crash")
+
+    mock_client = MagicMock(spec=httpx.Client)
+    task = _Task("task-15")
+    retry_or_fail_task(
+        task_id="task-15",
+        reason="agent crashed",
+        client=mock_client,
+        server_url="http://test",
+        max_task_retries=3,
+        retried_task_ids=set(),
+        tasks_snapshot={"active": [task]},
+        workdir=tmp_path,
+    )
+    metadata = _posted_metadata(mock_client)
+    assert metadata["retry_mode"] == "cold"
+    assert metadata["retry_downgrade_reason"] == "adapter_capability_none"
+
+
+def test_workspace_hash_unaffected_by_wip_commit(tmp_path: Path) -> None:
+    """Review question: does ``_save_partial_work``'s WIP git commit change
+    the ``workspace_hash`` a checkpoint already recorded?
+
+    ``workspace_hash`` walks the filesystem tree and explicitly excludes
+    ``.git``, and ``_save_partial_work`` only ever stages and commits
+    content that is already sitting in the worktree (``git add -A`` plus a
+    ``[WIP]`` commit), it does not edit any file. So a real WIP commit
+    over the same tree must not move the hash.
+    """
+    import subprocess
+
+    tree = _make_worktree(tmp_path)
+    (tree / "output.txt").write_text("agent wrote this before dying\n", encoding="utf-8")
+
+    before = workspace_hash(tree)
+    subprocess.run(["git", "init", "-q"], cwd=str(tree), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(tree), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(tree), check=True)
+    subprocess.run(["git", "add", "-A"], cwd=str(tree), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "[WIP] agent-1 partial work"],
+        cwd=str(tree),
+        check=True,
+        capture_output=True,
+    )
+    after = workspace_hash(tree)
+
+    assert before != ""
+    assert before == after
+
+
 def test_write_retry_checkpoint_workspace_mutated_after_write_downgrades(tmp_path: Path) -> None:
     """The other trap named alongside the fix: a workspace hashed too late.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -138,6 +139,14 @@ def _make_orch_no_ratelimit(tmp_path: Path) -> SimpleNamespace:  # type: ignore[
     orch._spawner = MagicMock()
     orch._spawner.get_worktree_path.return_value = None
     return orch
+
+
+def _posted_retry_metadata(mock_client: MagicMock) -> dict[str, Any]:
+    """Pull the ``metadata`` dict out of the POST that created the retry task."""
+    for call in mock_client.post.call_args_list:
+        if call.args and call.args[0].endswith("/tasks"):
+            return call.kwargs["json"]["metadata"]
+    raise AssertionError("no retry task was posted")
 
 
 # ---------------------------------------------------------------------------
@@ -1048,13 +1057,23 @@ def test_reap_wall_clock_timeout_writes_retry_checkpoint_before_orphan_handling(
     def _record_checkpoint_state(*_args, **_kwargs) -> None:
         seen["ref"] = checkpoint_retry.latest_checkpoint(tmp_path / ".sdd", "T-wct-1")
 
+    def _record_still_present_at_save(*_args, **_kwargs) -> bool:
+        # Symmetric with the crash test: the checkpoint must also still be
+        # there by the time _save_partial_work runs (it touches the
+        # worktree with its own WIP commit/merge right after).
+        seen["still_present_at_save"] = checkpoint_retry.latest_checkpoint(tmp_path / ".sdd", "T-wct-1") is not None
+        return False
+
     with (
         patch("bernstein.core.agents.agent_lifecycle._propagate_abort_to_children"),
         patch("bernstein.core.agents.agent_lifecycle._release_file_ownership"),
         patch("bernstein.core.agents.agent_lifecycle._release_task_to_session"),
         patch("bernstein.core.agents.agent_lifecycle._preserve_runner_logs"),
         patch("bernstein.core.agents.agent_lifecycle.handle_orphaned_task", side_effect=_record_checkpoint_state),
-        patch("bernstein.core.agents.agent_lifecycle._save_partial_work", return_value=False),
+        patch(
+            "bernstein.core.agents.agent_lifecycle._save_partial_work",
+            side_effect=_record_still_present_at_save,
+        ),
     ):
         _reap_wall_clock_timeout(orch, session, result, {}, runtime=42.0)
 
@@ -1062,6 +1081,7 @@ def test_reap_wall_clock_timeout_writes_retry_checkpoint_before_orphan_handling(
     assert ref is not None, "expected a checkpoint to already exist when orphan handling ran"
     assert ref.session_id == "agent-wct-1"
     assert ref.adapter == "claude"
+    assert seen.get("still_present_at_save") is True
 
 
 def test_reap_heartbeat_timeout_writes_retry_checkpoint_before_retry_or_fail_task(tmp_path: Path) -> None:
@@ -1113,6 +1133,103 @@ def test_reap_heartbeat_timeout_writes_retry_checkpoint_before_retry_or_fail_tas
     assert ref is not None, "expected a checkpoint to already exist when retry_or_fail_task ran"
     assert ref.session_id == "agent-hbt-1"
     assert ref.adapter == "claude"
+
+
+def test_handle_dead_agent_real_worktree_stamps_warm_despite_save_partial_work(tmp_path: Path) -> None:
+    """Review (Phoenix1504e, #5864): the crash test above mocks away
+    ``_maybe_preserve_worktree`` and ``_save_partial_work``, so it never
+    proves the interplay between the checkpoint write and what those two
+    functions do afterward. This runs both for real against a real git
+    worktree.
+
+    Answers the reviewer's two factual questions directly:
+
+    1. ``_maybe_preserve_worktree`` neither moves nor copies anything, it
+       only records a path string in ``orch._preserved_worktrees``. It is
+       not run mocked here.
+    2. ``_save_partial_work`` does destroy the worktree by the end of this
+       test (asserted below via ``cleanup_calls``/``tree.exists()``), because
+       its merge-and-cleanup step really does remove the directory in
+       production. But the retry decision is made earlier in the same
+       ``_handle_dead_agent`` call, inside the orphan-handling loop, before
+       ``_save_partial_work`` ever runs, so the later destruction cannot
+       un-stamp a decision already recorded. The retry task posted below
+       still carries ``retry_mode: warm``.
+    """
+    from bernstein.core.agents.agent_lifecycle import _handle_dead_agent
+
+    tree = tmp_path / "worktree"
+    _init_worktree_repo(tree)
+    # Uncommitted output left behind by the dying agent: present when the
+    # checkpoint hash is taken and still present, unchanged, when the retry
+    # decision re-hashes it a moment later, then folded into
+    # _save_partial_work's real WIP commit.
+    (tree / "output.txt").write_text("agent output\n", encoding="utf-8")
+
+    task = _make_task("T-crash-e2e")
+    task.status = TaskStatus.CLAIMED
+    session = AgentSession(
+        id="agent-crash-e2e",
+        role="backend",
+        provider="claude",
+        model_config=ModelConfig("claude-3", "high"),
+        task_ids=[task.id],
+        exit_code=1,
+        spawn_ts=time.time(),
+    )
+
+    orch = _make_orch_no_ratelimit(tmp_path)
+    orch._config.recovery = "restart"
+    orch._spawner.get_worktree_path.return_value = tree
+    orch._spawner.default_adapter_name = "claude"
+    orch._spawner.role_model_policy = None
+    orch._spawner.default_model = None
+    orch._agent_failure_timestamps = {}
+    orch._preserved_worktrees = {}
+    orch._signal_mgr = MagicMock()
+    # Both the top-of-orphan-handling re-fetch and retry_or_fail_task's own
+    # internal re-fetch hit GET .../tasks/<id>; answer both with the same
+    # task, still CLAIMED and un-retried.
+    _get_response = MagicMock()
+    _get_response.raise_for_status.return_value = None
+    _get_response.json.return_value = task.to_dict()
+    orch._client.get.return_value = _get_response
+
+    cleanup_calls: list[str] = []
+
+    def _fake_reap_completed_agent(session_arg: Any, skip_merge: bool = False, **_kw: Any) -> None:
+        # Real effect of merge_and_cleanup_worktree's cleanup step in
+        # production: WorktreeManager.cleanup runs `git worktree remove
+        # --force`, which removes the directory outright.
+        cleanup_calls.append(session_arg.id)
+        shutil.rmtree(tree, ignore_errors=True)
+
+    orch._spawner.reap_completed_agent.side_effect = _fake_reap_completed_agent
+
+    with (
+        patch("bernstein.core.agents.agent_lifecycle.transition_agent"),
+        patch("bernstein.core.agents.agent_lifecycle._capture_agent_crash"),
+        patch("bernstein.core.agents.agent_lifecycle._propagate_abort_to_children"),
+        patch("bernstein.core.agents.agent_lifecycle._release_file_ownership"),
+        patch("bernstein.core.agents.agent_lifecycle._release_task_to_session"),
+        patch("bernstein.core.agents.agent_lifecycle._preserve_runner_logs"),
+        patch("bernstein.core.agents.agent_lifecycle.collect_completion_data", return_value={"files_modified": []}),
+    ):
+        _handle_dead_agent(
+            orch,
+            session,
+            {"claimed": [task], "open": [], "in_progress": [], "done": []},
+        )
+
+    # _save_partial_work's real merge-and-cleanup step ran and actually
+    # destroyed the worktree, this is not a no-op stand-in for it.
+    assert cleanup_calls == ["agent-crash-e2e"]
+    assert not tree.exists()
+
+    metadata = _posted_retry_metadata(orch._client)
+    assert metadata["retry_mode"] == "warm"
+    assert metadata["retry_checkpoint_session_id"] == "agent-crash-e2e"
+    assert "retry_downgrade_reason" not in metadata
 
 
 def test_reap_wall_clock_timeout_logs_and_continues_when_evolution_raises(tmp_path: Path, caplog) -> None:  # type: ignore[no-untyped-def]

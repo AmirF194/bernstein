@@ -544,15 +544,30 @@ def _write_retry_checkpoint(orch: Any, session: AgentSession, *, detector: str) 
     caller (an operator's ``steer.pause``), so ``latest_checkpoint`` always
     saw nothing and ``_stamp_checkpoint_retry_metadata_safe`` above always
     stamped ``cold``/``no_checkpoint`` on the ordinary failure path. The
-    warm-resume machinery from #2359/#2403 never fired for the crash/gate-
-    failure/timeout cases it exists for. This writes the checkpoint that
-    stamp reads back, at the moment the dying session's native adapter,
-    session id and worktree are still known, mirroring
-    ``heartbeat._write_stall_checkpoint``'s resume-checkpoint write beside it
-    (issue #3376), one journal write earlier in the same death path.
+    warm-resume machinery from #2359/#2403 never fired for the crash/timeout
+    cases it exists for. This writes the checkpoint that stamp reads back, at
+    the moment the dying session's native adapter, session id and worktree
+    are still known, mirroring ``heartbeat._write_stall_checkpoint``'s
+    resume-checkpoint write beside it (issue #3376), one journal write
+    earlier in the same death path.
 
     Fail-open by design, like the stall checkpoint beside it: a write
     failure must never block the retry/DLQ decision that follows.
+
+    Ordering assumption: the two calls between this write and the actual
+    retry decision, ``_maybe_preserve_worktree`` (records a path in a
+    dict, touches no file) and the orphan-handling call that reaches
+    ``retry_or_fail_task``, run before ``_save_partial_work``'s WIP
+    commit/merge/cleanup ever touches this worktree, so the live
+    ``workspace_hash`` recompute that decides warm-vs-cold sees the same
+    tree this function just hashed. ``workspace_hash`` also excludes
+    ``.git``, so even a same-tree WIP commit taken later would not move it.
+    ``_save_partial_work``'s merge-and-cleanup step can and does remove the
+    worktree outright, but only after the decision above has already been
+    made and stamped onto the retry task's metadata, so a later destruction
+    cannot retroactively un-stamp it. If a future change moves the retry
+    decision to run after ``_save_partial_work``, this assumption breaks and
+    warm resume goes silently cold.
     """
     workdir = getattr(orch, "_workdir", None)
     if not isinstance(workdir, Path):
