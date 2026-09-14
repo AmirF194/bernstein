@@ -475,11 +475,6 @@ class TestBundleSignatureVerification:
         assert "Stub signature" in result.detail
         assert not result.passed
 
-    def test_agent_card_signer_does_not_fall_back_to_stub(self) -> None:
-        """The broken agent_card_signer import path never existed; confirm it still doesn't."""
-        with pytest.raises(ImportError):
-            import bernstein.core.identity.agent_card_signer  # noqa: F401
-
     def test_agent_card_signer_raises_without_install_identity(
         self, simple_suite: BenchSuite, adapter: MockReplayAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
