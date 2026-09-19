@@ -25,7 +25,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from bernstein.core.security.external_secret_store import (
@@ -51,6 +51,19 @@ class VaultTransport(Protocol):
     def __call__(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any] | None: ...
 
 
+class VaultHttpError(ExternalStoreError):
+    """``ExternalStoreError`` that keeps the HTTP status code when Vault gave one.
+
+    The store needs to tell "the accessor or role is gone" (a 400/404 from
+    Vault) apart from "this caller's token cannot see it" (403) or "Vault is
+    down" (no status). The status code is the only reliable discriminator.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class VaultHttpTransport:
     """Default transport: plain ``urllib`` calls against a Vault server.
@@ -63,7 +76,7 @@ class VaultHttpTransport:
     """
 
     addr: str
-    token: str
+    token: str = field(repr=False)
     timeout_seconds: float = 5.0
 
     def __call__(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -80,12 +93,17 @@ class VaultHttpTransport:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise ExternalStoreError(f"vault {method} {path} -> HTTP {exc.code}: {detail}") from exc
+            raise VaultHttpError(f"vault {method} {path} -> HTTP {exc.code}: {detail}", status=exc.code) from exc
         except urllib.error.URLError as exc:
-            raise ExternalStoreError(f"vault {method} {path} unreachable: {exc.reason}") from exc
+            raise VaultHttpError(f"vault {method} {path} unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise VaultHttpError(f"vault {method} {path} timed out after {self.timeout_seconds}s") from exc
         if not raw:
             return None
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise VaultHttpError(f"vault {method} {path} returned a non-JSON body") from exc
 
 
 class VaultTokenRoleStore(ExternalSecretStore):
@@ -108,8 +126,10 @@ class VaultTokenRoleStore(ExternalSecretStore):
     def resolve(self, path: str) -> SecretDescriptor:
         try:
             role = self._transport("GET", f"auth/token/roles/{path}")
-        except ExternalStoreError as exc:
-            raise ExternalStoreError(f"vault token role {path!r} not found: {exc}") from exc
+        except VaultHttpError as exc:
+            if exc.status == 404:
+                raise ExternalStoreError(f"vault token role {path!r} not found") from exc
+            raise
         if role is None:
             raise ExternalStoreError(f"vault token role {path!r} not found")
         data = role.get("data", {})
@@ -142,21 +162,40 @@ class VaultTokenRoleStore(ExternalSecretStore):
 
     def report_revocation(self, path: str, *, upstream_id: str) -> bool:
         if not upstream_id:
-            # No accessor to check against: fail closed, same direction
-            # ExternalStoreError already fails in, treat as revoked.
             return True
+        # The broker passes what resolve() returned. For this store that is
+        # the role name, not an accessor, so "is the role still usable" is
+        # the correct question. An accessor (from a minted credential) gets
+        # the lookup-accessor path instead.
+        if upstream_id == path:
+            return self._role_revoked(path)
+        return self._accessor_revoked(upstream_id)
+
+    def _role_revoked(self, path: str) -> bool:
+        try:
+            role = self._transport("GET", f"auth/token/roles/{path}")
+        except VaultHttpError as exc:
+            if exc.status == 404:
+                return True
+            raise
+        return role is None
+
+    def _accessor_revoked(self, accessor: str) -> bool:
         try:
             lookup = self._transport(
                 "POST",
                 "auth/token/lookup-accessor",
-                {"accessor": upstream_id},
+                {"accessor": accessor},
             )
-        except ExternalStoreError as exc:
-            # Vault returns 403/404 for an accessor it no longer knows
-            # about: treat that as "already revoked", the case this
-            # method exists to report, not as a transport failure.
-            logger.debug("vault lookup-accessor %s treated as revoked: %s", upstream_id, exc)
-            return True
+        except VaultHttpError as exc:
+            # Vault answers "invalid accessor" for an accessor it no longer
+            # knows; that is the revoked case this method reports. Everything
+            # else (403, 5xx, unreachable) is a caller or transport failure
+            # and must not be flattened into "revoked".
+            if exc.status == 400 and "invalid accessor" in str(exc):
+                logger.debug("vault lookup-accessor %s is gone: %s", accessor, exc)
+                return True
+            raise
         if lookup is None:
             return True
         ttl_remaining = lookup.get("data", {}).get("ttl", 0)

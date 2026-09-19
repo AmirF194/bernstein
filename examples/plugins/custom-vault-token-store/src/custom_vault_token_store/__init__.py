@@ -28,12 +28,14 @@ import os
 from bernstein.core.security.secret_store_registry import SecretStoreRegistration
 from bernstein.plugins import hookimpl
 from custom_vault_token_store._store import (
+    VaultHttpError,
     VaultHttpTransport,
     VaultTokenRoleStore,
     VaultTransport,
 )
 
 __all__ = [
+    "VaultHttpError",
     "VaultHttpTransport",
     "VaultTokenRoleStore",
     "VaultTokenStorePlugin",

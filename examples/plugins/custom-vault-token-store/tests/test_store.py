@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 import pytest
-from custom_vault_token_store import VaultTokenRoleStore, VaultTokenStorePlugin
+from custom_vault_token_store import VaultHttpError, VaultTokenRoleStore, VaultTokenStorePlugin
 
 from bernstein.core.security.external_secret_store import ExternalStoreError
 
@@ -130,14 +130,24 @@ class TestReportRevocation:
         store = VaultTokenRoleStore(transport=transport)
         assert store.report_revocation("bernstein-agent", upstream_id="acc-1") is True
 
-    def test_unknown_accessor_is_revoked(self) -> None:
-        """Vault 403s on an accessor it no longer knows about."""
+    def test_invalid_accessor_is_revoked(self) -> None:
+        """Vault answers 400 invalid accessor for an accessor it no longer knows."""
 
         def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
-            raise ExternalStoreError("HTTP 403: bad accessor")
+            raise VaultHttpError("vault POST auth/token/lookup-accessor -> HTTP 400: invalid accessor", status=400)
 
         store = VaultTokenRoleStore(transport=_raise)
         assert store.report_revocation("bernstein-agent", upstream_id="acc-gone") is True
+
+    def test_forbidden_accessor_lookup_is_not_revoked(self) -> None:
+        """A 403 on the broker's own token is a caller failure, not revocation."""
+
+        def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise VaultHttpError("vault POST auth/token/lookup-accessor -> HTTP 403: permission denied", status=403)
+
+        store = VaultTokenRoleStore(transport=_raise)
+        with pytest.raises(ExternalStoreError):
+            store.report_revocation("bernstein-agent", upstream_id="acc-gone")
 
     def test_no_upstream_id_fails_closed(self) -> None:
         store = VaultTokenRoleStore(transport=_FakeTransport({}))
@@ -162,3 +172,47 @@ class TestPluginRegistration:
     def test_plugin_class_has_stable_name(self) -> None:
         assert VaultTokenStorePlugin.plugin_name == "custom-vault-token-store"
         assert VaultTokenStorePlugin.hook_target == "provide_secret_store"
+
+
+class _BrokerFakeTransport:
+    """Scripted transport that records every call, for the broker path."""
+
+    def __init__(self, responses: dict[tuple[str, str], dict[str, Any] | None]) -> None:
+        self._responses = responses
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def __call__(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        self.calls.append((method, path, body))
+        key = (method, path)
+        if key not in self._responses:
+            raise VaultHttpError(f"unscripted call: {method} {path}", status=404)
+        return self._responses[key]
+
+
+class TestBrokerMint:
+    def test_mint_checks_role_not_accessor(self) -> None:
+        from bernstein.core.security.secrets_broker import (
+            BrokerConfig,
+            ExternalStoreBackend,
+            SecretsBroker,
+        )
+
+        transport = _BrokerFakeTransport(
+            {
+                ("GET", "auth/token/roles/bernstein-agent"): {
+                    "data": {"name": "bernstein-agent", "token_explicit_max_ttl": 600},
+                },
+                ("POST", "auth/token/create/bernstein-agent"): {
+                    "auth": {"client_token": "s.abc123", "accessor": "acc-1", "lease_duration": 60},
+                },
+            }
+        )
+        store = VaultTokenRoleStore(transport=transport)
+        backend = ExternalStoreBackend(store=store, store_name="vault")
+        broker = SecretsBroker(backend=backend, config=BrokerConfig(backend="external"))
+
+        token = broker.mint(secret_name="vault:bernstein-agent", task_id="task-1", ttl_seconds=60)
+
+        assert token.secret_name == "vault:bernstein-agent"
+        assert ("GET", "auth/token/roles/bernstein-agent") in [(m, p) for m, p, _ in transport.calls]
+        assert not any(p == "auth/token/lookup-accessor" for _, p, _ in transport.calls)
