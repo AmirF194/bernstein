@@ -151,7 +151,7 @@ class VaultTokenRoleStore(ExternalSecretStore):
         auth = response.get("auth")
         if not auth or not auth.get("client_token"):
             raise ExternalStoreError(f"vault token create/{path} returned no auth block")
-        lease_duration = int(auth.get("lease_duration") or ttl_seconds)
+        lease_duration = int(auth.get("lease_duration") or 0)
         capped_ttl = min(ttl_seconds, lease_duration) if lease_duration else ttl_seconds
         return ExternalCredential(
             value=auth["client_token"],

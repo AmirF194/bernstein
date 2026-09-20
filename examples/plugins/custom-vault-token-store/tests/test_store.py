@@ -90,6 +90,19 @@ class TestMintCredential:
         credential = store.mint_credential("bernstein-agent", audience="", ttl_seconds=600)
         assert before + 30 <= credential.expires_at <= before + 31
 
+    def test_mint_caps_to_requested_ttl_when_vault_reports_no_lease(self) -> None:
+        transport = _FakeTransport(
+            {
+                ("POST", "auth/token/create/bernstein-agent"): {
+                    "auth": {"client_token": "s.abc123", "accessor": "acc-1"},
+                },
+            }
+        )
+        store = VaultTokenRoleStore(transport=transport)
+        before = time.time()
+        credential = store.mint_credential("bernstein-agent", audience="", ttl_seconds=60)
+        assert before + 60 <= credential.expires_at <= before + 61
+
     def test_mint_sanitizes_display_name(self) -> None:
         transport = _FakeTransport(
             {
