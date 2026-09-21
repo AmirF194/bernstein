@@ -426,3 +426,41 @@ def test_release_creation_does_not_fall_back_to_generated_notes_only(
     run = _step_run(workflow, RELEASE_JOB, "Create release")
     commands = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
     assert "--generate-notes" not in commands, "--generate-notes publishes the machine changelog as the whole body"
+
+
+def test_docker_mcp_catalog_source_commit_check_exists(workflow: dict[str, Any]) -> None:
+    """The docker-mcp catalog's source.commit must be pinned and validated.
+
+    The catalog's server.yaml contains a hand‑maintained source.commit pin
+    that cannot match the release commit on the tag path (the commit that
+    contains the file cannot be its own hash). The workflow annotates stale
+    pins as warnings and renders a fresh payload with the correct commit
+    before opening the catalog PR.
+
+    This test ensures the validation step is present and contains the logic
+    that extracts the pinned commit and compares it to HEAD.
+    """
+    step = _step(workflow, "publish-mcp-registry", "Annotate stale docker-mcp catalog source.commit")
+    run = step.get("run")
+    assert isinstance(run, str)
+    # Must read packaging/docker-mcp/server.yaml
+    assert "packaging/docker-mcp/server.yaml" in run
+    # Must extract a 40‑char hex SHA
+    assert "([0-9a-f]{40})" in run
+    # Must compare pinned != head
+    assert "pinned != head" in run
+    # Must define warning annotation
+    assert 'annotation = "warning"' in run
+
+
+def test_docker_mcp_catalog_render_step_exists(workflow: dict[str, Any]) -> None:
+    """The stale pin is replaced by a rendered payload with the actual release commit."""
+    step = _step(workflow, "publish-mcp-registry", "Render docker-mcp catalog with release commit")
+    run = step.get("run")
+    assert isinstance(run, str)
+    # Must call the render script
+    assert "scripts/render_docker_mcp_catalog.py" in run
+    # Must substitute the release commit
+    assert "RELEASE_COMMIT=$(git rev-parse HEAD)" in run
+    # Must produce server.yaml.rendered
+    assert "server.yaml.rendered" in run
