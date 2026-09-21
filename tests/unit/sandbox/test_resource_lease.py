@@ -198,6 +198,10 @@ def test_keepalive_on_a_reclaimed_lease_refuses(store: LeaseStore) -> None:
     lease.release()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="_reclaim_lock is a documented no-op without fcntl, so this needs real POSIX flock semantics",
+)
 def test_keepalive_and_reclaim_serialise_on_the_same_resource(store: LeaseStore) -> None:
     """The interleaving the sequential test above cannot reach: a keepalive's read
     happens while the lease is still valid, and a concurrent reclaim attempt must not
