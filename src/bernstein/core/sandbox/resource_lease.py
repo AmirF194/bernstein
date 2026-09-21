@@ -251,6 +251,7 @@ def _reclaim_lock(path: Path) -> Generator[None]:
     the old holder's stale one. Same primitive and Windows fallback as
     ``bernstein.core.memory.chain._exclusive_lock``.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f"{path.name}.lock")
     if fcntl is None:  # pragma: no cover - Windows path
         yield
