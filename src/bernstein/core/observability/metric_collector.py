@@ -334,9 +334,9 @@ class MetricsCollector:
             self._task_metrics.clear()
 
     def reset_agent_metrics(self) -> None:
-        """Clear all agent metrics. Called on orchestrator restart so a
-        prior run's agents don't get merged into this run's retrospective
-        agent summary."""
+        """Clear all agent metrics. Called on Orchestrator construction so a
+        prior instance's agents in the same process don't get merged into
+        this instance's retrospective summary or total cost."""
         with self._lock:
             self._agent_metrics.clear()
 
