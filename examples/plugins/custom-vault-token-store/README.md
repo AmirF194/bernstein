@@ -16,7 +16,12 @@ pip install -e examples/plugins/custom-vault-token-store
 ```
 
 bernstein discovers the plugin via the `bernstein.plugins` entry-point
-group declared in `pyproject.toml`.
+group declared in `pyproject.toml`. Entry-point discovery only loads
+the plugin object, though, it does not itself register the store.
+Something in your startup path still needs to call
+`bernstein.core.security.secret_store_registry.discover_plugin_secret_stores()`
+(core does not call it automatically yet) before the broker is built, or
+`vault:...` references resolve to `Unknown secret store 'vault'`.
 
 ## setup
 
@@ -62,6 +67,9 @@ point this plugin at one.
   accessor up (`auth/token/lookup-accessor`); only Vault's
   `400 invalid accessor` answer means revoked. A 403, a 5xx, or an
   unreachable server re-raises rather than pretending the token is gone.
+  A zero (or missing) remaining `ttl` on the lookup response is also
+  treated as revoked, fail-closed; this store never mints without an
+  explicit ttl, so a real minted accessor never hits that branch.
 
 ## what gets recorded
 

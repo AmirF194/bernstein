@@ -48,9 +48,30 @@ class TestResolve:
         assert descriptor.expires_at > time.time()
 
     def test_missing_role_raises(self) -> None:
-        transport = _FakeTransport({})
-        store = VaultTokenRoleStore(transport=transport)
-        with pytest.raises(ExternalStoreError, match="bernstein-agent"):
+        """A real 404 from Vault takes the not-found branch, not a bare re-raise.
+
+        The message is the branch's own literal ("vault token role ... not
+        found"), not the transport's raw HTTP-404 text, so a mutation that
+        breaks the ``exc.status == 404`` check (making this fall through to
+        the bare ``raise``) fails this assertion instead of passing it by
+        coincidence.
+        """
+
+        def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise VaultHttpError("vault GET auth/token/roles/bernstein-agent -> HTTP 404: role not found", status=404)
+
+        store = VaultTokenRoleStore(transport=_raise)
+        with pytest.raises(ExternalStoreError, match=r"vault token role 'bernstein-agent' not found"):
+            store.resolve("bernstein-agent")
+
+    def test_non_404_role_error_reraises_unwrapped(self) -> None:
+        """A 403/5xx on resolve() must not be flattened into the not-found message."""
+
+        def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise VaultHttpError("vault GET auth/token/roles/bernstein-agent -> HTTP 500: internal error", status=500)
+
+        store = VaultTokenRoleStore(transport=_raise)
+        with pytest.raises(VaultHttpError, match="HTTP 500"):
             store.resolve("bernstein-agent")
 
 
@@ -165,6 +186,25 @@ class TestReportRevocation:
     def test_no_upstream_id_fails_closed(self) -> None:
         store = VaultTokenRoleStore(transport=_FakeTransport({}))
         assert store.report_revocation("bernstein-agent", upstream_id="") is True
+
+    def test_role_gone_is_revoked(self) -> None:
+        """upstream_id == path takes the role-check branch (_role_revoked), not accessor lookup."""
+
+        def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise VaultHttpError("vault GET auth/token/roles/bernstein-agent -> HTTP 404: role not found", status=404)
+
+        store = VaultTokenRoleStore(transport=_raise)
+        assert store.report_revocation("bernstein-agent", upstream_id="bernstein-agent") is True
+
+    def test_role_lookup_failure_reraises(self) -> None:
+        """A 403/5xx on the role-check branch is a caller/transport failure, not revocation."""
+
+        def _raise(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise VaultHttpError("vault GET auth/token/roles/bernstein-agent -> HTTP 500: internal error", status=500)
+
+        store = VaultTokenRoleStore(transport=_raise)
+        with pytest.raises(VaultHttpError):
+            store.report_revocation("bernstein-agent", upstream_id="bernstein-agent")
 
 
 class TestPluginRegistration:

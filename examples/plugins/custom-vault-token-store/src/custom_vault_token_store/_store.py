@@ -6,8 +6,13 @@ token-role machinery so every ``mint_credential`` call mints a genuinely
 new, Vault-issued, short-lived token rather than handing back a static
 KV value with no real expiry.
 
-Naming: ``path`` is a Vault token role name (``vault:auth/token/roles/<path>``
-via ``SecretRef``). The role must already exist in Vault
+Naming: ``path`` is a Vault token role name, referenced as ``vault:<path>``
+(for example ``vault:bernstein-agent``) via ``SecretRef``. The store
+prefixes the Vault API path itself, so the reference is just the role
+name, never ``vault:auth/token/roles/<path>``. The expansion differs per
+call: ``resolve``/``report_revocation``'s role branch read
+``auth/token/roles/<path>``, ``mint_credential`` posts to
+``auth/token/create/<path>``. The role must already exist in Vault
 (``vault write auth/token/roles/<path> ...``); this plugin only mints
 against it, it does not manage role configuration.
 
