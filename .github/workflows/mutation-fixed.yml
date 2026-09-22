@@ -4,8 +4,10 @@
 # fires on PRs that *touch* a given file, so stable critical modules with
 # stale tests never get exercised. This workflow runs the focused harness
 # in scripts/mutmut_critical.py against a fixed set of high-risk modules
-# (atomic claim, HMAC audit chain, lineage v1, config seed parser) and
-# fails the gate when kill rate drops below the per-module threshold
+# (atomic claim, HMAC audit chain, lineage v1, config seed parser, the
+# replay journal verifier, and four security-enforcement modules: sandbox
+# eval, policy engine, compliance policies, audit pack) and fails the gate
+# when kill rate drops below the per-module threshold
 # (see scripts/mutmut_critical.py:MODULES).
 #
 # Trigger model:
@@ -25,11 +27,12 @@
 # module uploads its JSON as an artifact for offline reading.
 #
 # `continue-on-error` is per-module (matrix `include` below), not a
-# blanket flag. Six of the seven modules hold their threshold with real
+# blanket flag. Six of the twelve modules hold their threshold with real
 # margin and gate for real: a kill-rate drop fails the workflow on the
-# weekly audit. `audit_log` is the one pinned exception - see its `include` entry and
+# weekly audit. The other six (including `audit_log`) are pinned
+# exceptions - see their `include` entries and
 # tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES for
-# the kill-rate data behind it and the revisit date.
+# the kill-rate data behind each and the revisit date.
 name: Mutation (fixed critical paths)
 
 on:

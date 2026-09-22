@@ -199,24 +199,26 @@ in a comment-only path), document why in `mutmut_config.py`.
 ### mutmut fixed-paths gate
 `mutation-fixed.yml` runs `scripts/mutmut_critical.py` against a
 fixed list of high-risk modules (atomic claim, HMAC audit chain,
-audit integrity verifier, lineage v1 trio, seed parser) and gates
-on a per-module kill rate. The module list, per-module thresholds,
-and wall-clock budgets live in `scripts/mutmut_critical.py:MODULES`.
+audit integrity verifier, lineage v1 trio, seed parser, the replay
+journal verifier, and four security-enforcement modules: sandbox eval,
+policy engine, compliance policies, audit pack) and gates on a
+per-module kill rate. The module list, per-module thresholds, and
+wall-clock budgets live in `scripts/mutmut_critical.py:MODULES`.
 
 The gate enforces per module: `continue-on-error` in the workflow's
 matrix `include` is `false` for every module that holds its threshold
 with real margin, so a regression there fails the weekly audit run.
-`audit_log` is the one pinned exception - its kill rate is well below threshold and needs test
-backfill on `src/bernstein/core/security/audit.py` before it can gate
-for real (`tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES`
-is the source of truth for which modules are still advisory). Each
+Six modules (including `audit_log`) are pinned exceptions, still below
+threshold and needing test backfill before they can gate for real -
+`tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES` is
+the source of truth for the current set and the data behind each. Each
 module uploads its result JSON - score and survivor list - as a
 workflow artifact either way.
 
 Reproduce locally:
 
 ```bash
-# All modules (slow - budgets sum to about an hour).
+# All modules (slow - budgets sum to about 3.1 hours).
 uv run python scripts/mutmut_critical.py
 
 # One module:

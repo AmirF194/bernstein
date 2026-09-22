@@ -178,7 +178,12 @@ MODULES: tuple[Module, ...] = (
             "tests/unit/core/replay/test_journal_verify_mutation_kill.py",
         ),
         threshold=0.70,
-        budget_seconds=1800,
+        # 1800 does not fit the step's own 1500s cap once its baseline
+        # (max(budget // 4, 180) = 450) is added on top (2250s, and the
+        # true worst case is 450 + 1800 + 450 = 2700s since the deadline
+        # is only checked at the top of each loop iteration). Lowered to
+        # match claim_next: 1200 + 300 baseline = 1500 exactly.
+        budget_seconds=1200,
         max_candidates=120,
         note="Replay journal verifier (issue #3654): verify_journal / verify_events.",
     ),

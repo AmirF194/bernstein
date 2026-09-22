@@ -19,11 +19,12 @@ it - so the exception can't grow by omission.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import cast
 
 import yaml
-from scripts.mutmut_critical import MODULES
+from scripts.mutmut_critical import _MUTANT_RUN_TIMEOUT, MODULES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "mutation-fixed.yml"
@@ -44,9 +45,10 @@ ADVISORY_MODULES: set[str] = {
 
 # Dedicated test files for the four security-enforcement modules (issue
 # #5947). Listed by path, not dotted import: pytest.ini_options.testpaths
-# execution needs a real filesystem path, and these modules are reachable
-# only through src/bernstein/core/__init__.py's _REDIRECT_MAP alias, so a
-# dotted-path selection would silently run against the wrong file.
+# execution needs a real filesystem path, so a dotted-path selection cannot
+# be used here regardless (three of the four are also reachable through
+# src/bernstein/core/__init__.py's _REDIRECT_MAP alias; audit_pack is not,
+# and its test imports the physical path directly either way).
 _SECURITY_MODULE_TESTS: dict[str, tuple[str, ...]] = {
     "sandbox_eval": ("tests/unit/test_sandbox_eval.py",),
     "policy_engine": (
@@ -98,6 +100,15 @@ def _harness_step() -> dict[str, object]:
     matches = [s for s in steps if s.get("name") == "Run focused mutation harness"]
     assert len(matches) == 1, "expected exactly one 'Run focused mutation harness' step"
     return cast("dict[str, object]", matches[0])
+
+
+def _harness_step_timeout_seconds() -> int:
+    """The wall-clock cap the harness step itself imposes (`timeout <N> uv run ...`)."""
+    run = _harness_step().get("run")
+    assert isinstance(run, str)
+    match = re.search(r"timeout (\d+) uv run", run)
+    assert match, "expected a `timeout <seconds> uv run ...` wrapper on the harness step"
+    return int(match.group(1))
 
 
 def _upload_step() -> dict[str, object]:
@@ -183,6 +194,29 @@ def test_upload_step_still_runs_after_a_failing_harness() -> None:
     )
 
 
+def test_module_budgets_fit_the_step_timeout() -> None:
+    """Every module's budget, plus its own baseline check, must fit the step.
+
+    ``main()`` writes the result JSON only after its run loop finishes, so a
+    ``timeout`` SIGTERM mid-run drops the module's JSON silently (the upload
+    step is ``if-no-files-found: warn`` and advisory modules are
+    ``continue-on-error: true``); the run goes green with nothing uploaded,
+    and a module stays advisory forever because its kill-rate data never
+    arrives (issue #5947). The deadline is only checked at the top of each
+    mutant loop iteration, so the true worst case is baseline + budget + one
+    more mutant run, not just baseline + budget; this asserts the cheaper,
+    still-sufficient bound of the two.
+    """
+    step_timeout = _harness_step_timeout_seconds()
+    for m in MODULES:
+        baseline = max(m.budget_seconds // 4, _MUTANT_RUN_TIMEOUT)
+        total = m.budget_seconds + baseline
+        assert total <= step_timeout, (
+            f"{m.key!r} budget_seconds={m.budget_seconds} + baseline={baseline} = "
+            f"{total}s exceeds the harness step's {step_timeout}s timeout"
+        )
+
+
 def test_matrix_modules_match_registry() -> None:
     """The workflow matrix and MODULES must gate the same module set.
 
@@ -204,10 +238,9 @@ def test_matrix_modules_match_registry() -> None:
 def test_security_modules_registered() -> None:
     """The four security-enforcement modules from issue #5947 are gated.
 
-    Registered by ``tests=`` file path, not dotted import: these modules
-    are reachable only through src/bernstein/core/__init__.py's
-    _REDIRECT_MAP alias, so a dotted-path test selection would silently
-    score the wrong (or no) tests.
+    Registered by ``tests=`` file path, not dotted import: pytest's
+    testpaths execution needs a real filesystem path regardless, so a
+    dotted-path test selection would silently score the wrong (or no) tests.
     """
     by_key = {m.key: m for m in MODULES}
     for key, expected_tests in _SECURITY_MODULE_TESTS.items():
