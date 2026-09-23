@@ -1023,7 +1023,9 @@ def test_handle_dead_agent_writes_retry_checkpoint_before_orphan_handling(tmp_pa
 
     ref = checkpoint_seen_by_orphan_handler.get("ref")
     assert ref is not None, "expected a checkpoint to already exist when orphan handling ran"
-    assert ref.session_id == "agent-crash-1"
+    # Not "agent-crash-1": Bernstein's own session label is not a native
+    # adapter session id, so the writer leaves this empty (review, #5864).
+    assert ref.session_id == ""
     assert ref.adapter == "claude"
     assert checkpoint_seen_by_orphan_handler.get("still_present_at_save") is True
 
@@ -1079,7 +1081,10 @@ def test_reap_wall_clock_timeout_writes_retry_checkpoint_before_orphan_handling(
 
     ref = seen.get("ref")
     assert ref is not None, "expected a checkpoint to already exist when orphan handling ran"
-    assert ref.session_id == "agent-wct-1"
+    # Not "agent-wct-1": that's Bernstein's own session label, not a native
+    # id any adapter handed back, so the writer leaves this empty (review,
+    # #5864).
+    assert ref.session_id == ""
     assert ref.adapter == "claude"
     assert seen.get("still_present_at_save") is True
 
@@ -1131,11 +1136,12 @@ def test_reap_heartbeat_timeout_writes_retry_checkpoint_before_retry_or_fail_tas
 
     ref = seen.get("ref")
     assert ref is not None, "expected a checkpoint to already exist when retry_or_fail_task ran"
-    assert ref.session_id == "agent-hbt-1"
+    # Not "agent-hbt-1": see the wall-clock-timeout test above.
+    assert ref.session_id == ""
     assert ref.adapter == "claude"
 
 
-def test_handle_dead_agent_real_worktree_stamps_warm_despite_save_partial_work(tmp_path: Path) -> None:
+def test_handle_dead_agent_real_worktree_checkpoint_survives_save_partial_work(tmp_path: Path) -> None:
     """Review (Phoenix1504e, #5864): the crash test above mocks away
     ``_maybe_preserve_worktree`` and ``_save_partial_work``, so it never
     proves the interplay between the checkpoint write and what those two
@@ -1153,8 +1159,14 @@ def test_handle_dead_agent_real_worktree_stamps_warm_despite_save_partial_work(t
        production. But the retry decision is made earlier in the same
        ``_handle_dead_agent`` call, inside the orphan-handling loop, before
        ``_save_partial_work`` ever runs, so the later destruction cannot
-       un-stamp a decision already recorded. The retry task posted below
-       still carries ``retry_mode: warm``.
+       un-stamp a decision already recorded.
+
+    The retry task posted below carries ``retry_mode: cold`` with
+    ``retry_downgrade_reason: no_session_id``, not ``no_checkpoint``: a
+    checkpoint really was recorded (adapter + workspace hash), it just has
+    no session id, because Bernstein's own session label is not a native
+    adapter session id (second review round, Chirag6722). That distinction,
+    not "warm", is what this test now pins.
     """
     from bernstein.core.agents.agent_lifecycle import _handle_dead_agent
 
@@ -1227,9 +1239,9 @@ def test_handle_dead_agent_real_worktree_stamps_warm_despite_save_partial_work(t
     assert not tree.exists()
 
     metadata = _posted_retry_metadata(orch._client)
-    assert metadata["retry_mode"] == "warm"
-    assert metadata["retry_checkpoint_session_id"] == "agent-crash-e2e"
-    assert "retry_downgrade_reason" not in metadata
+    assert metadata["retry_mode"] == "cold"
+    assert metadata["retry_downgrade_reason"] == "no_session_id"
+    assert "retry_checkpoint_session_id" not in metadata
 
 
 def test_reap_wall_clock_timeout_logs_and_continues_when_evolution_raises(tmp_path: Path, caplog) -> None:  # type: ignore[no-untyped-def]

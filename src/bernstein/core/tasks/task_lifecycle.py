@@ -546,10 +546,25 @@ def _write_retry_checkpoint(orch: Any, session: AgentSession, *, detector: str) 
     stamped ``cold``/``no_checkpoint`` on the ordinary failure path. The
     warm-resume machinery from #2359/#2403 never fired for the crash/timeout
     cases it exists for. This writes the checkpoint that stamp reads back, at
-    the moment the dying session's native adapter, session id and worktree
-    are still known, mirroring ``heartbeat._write_stall_checkpoint``'s
-    resume-checkpoint write beside it (issue #3376), one journal write
-    earlier in the same death path.
+    the moment the dying session's adapter and worktree are still known,
+    mirroring ``heartbeat._write_stall_checkpoint``'s resume-checkpoint write
+    beside it (issue #3376), one journal write earlier in the same death path.
+
+    ``session.id`` (``f"{role}-{uuid.uuid4().hex[:8]}"``) is Bernstein's own
+    label for the session, not what ``CheckpointRef.session_id`` is
+    documented to hold: "the native session identifier the adapter handed
+    back". No adapter in this repo currently returns one: ``Adapter.resume``
+    (``adapters/base.py``) is unoverridden everywhere, so its default
+    ``return None`` (fall back to a fresh spawn) is the only behavior any
+    adapter has, so there is nothing native to record here yet. Recording
+    ``session.id`` under this field would stamp ``retry_mode: warm`` for a
+    resume no adapter can perform and seal that claim into the HMAC audit
+    chain with no way for a later reader to tell it was never resumable. This
+    writer therefore leaves ``session_id`` empty; ``decide_retry`` already
+    downgrades a checkpoint with no session id to cold (``no_session_id``),
+    the same as if no checkpoint existed, while the adapter name and
+    workspace hash still get recorded for whichever future adapter grows a
+    real ``resume()`` and can be threaded through here.
 
     Fail-open by design, like the stall checkpoint beside it: a write
     failure must never block the retry/DLQ decision that follows.
@@ -591,7 +606,12 @@ def _write_retry_checkpoint(orch: Any, session: AgentSession, *, detector: str) 
                 sdd_dir=workdir / ".sdd",
                 task_id=task_id,
                 adapter=adapter_name or "",
-                session_id=session.id,
+                # Not session.id: see the docstring above. No adapter hands
+                # back a native session id yet, so there is nothing
+                # resumable to record; an empty session_id makes
+                # decide_retry downgrade this to cold (no_session_id)
+                # instead of claiming a warm resume nothing can perform.
+                session_id="",
                 workspace_hash=ws_hash,
                 worktree_path=str(worktree_path),
             )

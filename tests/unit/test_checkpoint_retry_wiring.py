@@ -272,8 +272,8 @@ def _make_session(task_ids: list[str], *, session_id: str = "agent-1") -> Any:
     )
 
 
-def test_write_retry_checkpoint_before_retry_stamps_warm(tmp_path: Path) -> None:
-    """#5844: the ordinary crash/timeout retry path now has a real writer.
+def test_write_retry_checkpoint_never_stamps_bernsteins_own_session_label(tmp_path: Path) -> None:
+    """#5844 + review: the writer fires, but never claims a native session id.
 
     ``_write_retry_checkpoint`` is what ``_handle_dead_agent``,
     ``_reap_wall_clock_timeout`` and ``_reap_heartbeat_timeout`` call before
@@ -281,12 +281,27 @@ def test_write_retry_checkpoint_before_retry_stamps_warm(tmp_path: Path) -> None
     internals by calling it with the same surface they pass (an orch exposing
     ``_workdir``/``_spawner.get_worktree_path``/``_spawner.default_adapter_name``
     and a session exposing ``id``/``task_ids``/``provider``/``model_config``).
+
+    ``session.id`` ("sess-8" here) is Bernstein's own label, not a session id
+    any adapter handed back, and no adapter in this repo implements
+    ``resume()`` yet. So even though the session has a real, non-empty id,
+    the checkpoint must still land with an empty ``session_id`` (checked via
+    ``latest_checkpoint`` below) and the retry must downgrade to cold with
+    ``no_session_id`` rather than stamp a warm decision nothing can act on.
     """
+    from bernstein.core.tasks.checkpoint_retry import latest_checkpoint
+
     tree = _make_worktree(tmp_path)
     session = _make_session(["task-8"], session_id="sess-8")
     orch = _make_orch(tmp_path, tree)
 
     _write_retry_checkpoint(orch, session, detector="crash")
+
+    checkpoint = latest_checkpoint(tmp_path / ".sdd", "task-8")
+    assert checkpoint is not None
+    assert checkpoint.adapter == "claude"
+    assert checkpoint.workspace_hash == workspace_hash(tree)
+    assert checkpoint.session_id == ""
 
     mock_client = MagicMock(spec=httpx.Client)
     task = _Task("task-8")
@@ -301,17 +316,16 @@ def test_write_retry_checkpoint_before_retry_stamps_warm(tmp_path: Path) -> None
         workdir=tmp_path,
     )
     metadata = _posted_metadata(mock_client)
-    assert metadata["retry_mode"] == "warm"
-    assert metadata["retry_checkpoint_session_id"] == "sess-8"
-    assert "retry_downgrade_reason" not in metadata
+    assert metadata["retry_mode"] == "cold"
+    assert metadata["retry_downgrade_reason"] == "no_session_id"
 
 
 def test_write_retry_checkpoint_empty_session_id_downgrades(tmp_path: Path) -> None:
-    """A checkpoint recorded with no native session id must still downgrade.
+    """Same outcome, this time with a session that has no id at all.
 
-    Named explicitly by the maintainer alongside the fix: a writer that
-    records an empty ``session_id`` produces a checkpoint that downgrades
-    with ``no_session_id`` rather than silently resuming nothing.
+    ``decide_retry``'s ``no_session_id`` downgrade does not distinguish a
+    session with no id from one whose id the writer deliberately withheld
+    (the test above); both leave the checkpoint's ``session_id`` empty.
     """
     tree = _make_worktree(tmp_path)
     session = _make_session(["task-9"], session_id="")
@@ -336,16 +350,23 @@ def test_write_retry_checkpoint_empty_session_id_downgrades(tmp_path: Path) -> N
     assert metadata["retry_downgrade_reason"] == "no_session_id"
 
 
-def test_write_retry_checkpoint_empty_adapter_downgrades(tmp_path: Path) -> None:
-    """A third trap of the same class as the session-id and hash traps above.
+def test_write_retry_checkpoint_resolves_empty_adapter_when_unrecognised(tmp_path: Path) -> None:
+    """A third resolution trap, same class as the session-id and hash ones above.
 
     ``adapter_name_for_provider`` and ``default_adapter_name`` can both miss
     (an unrecognised provider/model with no configured default), so the
-    checkpoint records ``adapter=""``. ``decide_retry`` treats a falsy
-    adapter as ``CheckpointRetryCapability.NONE``, so this must downgrade
-    with a named reason (``adapter_capability_none``) rather than attempt a
-    resume under an empty adapter name.
+    checkpoint the writer records must carry ``adapter=""`` rather than
+    guessing. ``decide_retry`` treating a falsy adapter as
+    ``CheckpointRetryCapability.NONE`` (downgrade reason
+    ``adapter_capability_none``) is covered directly against ``decide_retry``
+    in ``test_checkpoint_retry.py``; the writer's ``session_id=""`` (see the
+    tests above) takes precedence in ``decide_retry``'s resolution order, so
+    the reason surfaced through the full retry path here is ``no_session_id``,
+    so this test's job is only to confirm the writer resolves and records
+    ``adapter=""`` rather than a stale or guessed name.
     """
+    from bernstein.core.tasks.checkpoint_retry import latest_checkpoint
+
     tree = _make_worktree(tmp_path)
     session = _make_session(["task-15"], session_id="sess-15")
     session.provider = "totally-unrecognised-provider"
@@ -354,6 +375,10 @@ def test_write_retry_checkpoint_empty_adapter_downgrades(tmp_path: Path) -> None
     orch._spawner.default_adapter_name = None  # both resolution routes miss
 
     _write_retry_checkpoint(orch, session, detector="crash")
+
+    checkpoint = latest_checkpoint(tmp_path / ".sdd", "task-15")
+    assert checkpoint is not None
+    assert checkpoint.adapter == ""
 
     mock_client = MagicMock(spec=httpx.Client)
     task = _Task("task-15")
@@ -369,7 +394,7 @@ def test_write_retry_checkpoint_empty_adapter_downgrades(tmp_path: Path) -> None
     )
     metadata = _posted_metadata(mock_client)
     assert metadata["retry_mode"] == "cold"
-    assert metadata["retry_downgrade_reason"] == "adapter_capability_none"
+    assert metadata["retry_downgrade_reason"] == "no_session_id"
 
 
 def test_workspace_hash_unaffected_by_wip_commit(tmp_path: Path) -> None:
@@ -404,21 +429,28 @@ def test_workspace_hash_unaffected_by_wip_commit(tmp_path: Path) -> None:
     assert before == after
 
 
-def test_write_retry_checkpoint_workspace_mutated_after_write_downgrades(tmp_path: Path) -> None:
+def test_write_retry_checkpoint_records_hash_before_later_mutation(tmp_path: Path) -> None:
     """The other trap named alongside the fix: a workspace hashed too late.
 
-    Once ``_write_retry_checkpoint`` has recorded the workspace hash, any
-    further change to the worktree (e.g. a cleanup step running after the
-    checkpoint instead of before it) must downgrade the retry to cold with
-    ``workspace_hash_mismatch`` rather than resuming against a workspace the
-    checkpoint no longer describes.
+    ``_write_retry_checkpoint`` must record the workspace hash as it stood at
+    write time, not whatever it becomes after (e.g. a cleanup step running
+    after the checkpoint instead of before it). The retry's own
+    ``retry_downgrade_reason`` is ``no_session_id`` regardless, since
+    ``decide_retry`` checks for a session id before it ever compares
+    workspace hashes (the writer never has one to give it, see the tests
+    above); the recorded hash not matching a workspace mutated afterward is
+    what this test pins directly against the checkpoint.
     """
+    from bernstein.core.tasks.checkpoint_retry import latest_checkpoint
+
     tree = _make_worktree(tmp_path)
     session = _make_session(["task-10"], session_id="sess-10")
     orch = _make_orch(tmp_path, tree)
 
     _write_retry_checkpoint(orch, session, detector="crash")
+    recorded_hash = latest_checkpoint(tmp_path / ".sdd", "task-10").workspace_hash
     (tree / "main.py").write_text("print('mutated')\n", encoding="utf-8")
+    assert recorded_hash != workspace_hash(tree)
 
     mock_client = MagicMock(spec=httpx.Client)
     task = _Task("task-10")
@@ -434,7 +466,7 @@ def test_write_retry_checkpoint_workspace_mutated_after_write_downgrades(tmp_pat
     )
     metadata = _posted_metadata(mock_client)
     assert metadata["retry_mode"] == "cold"
-    assert metadata["retry_downgrade_reason"] == "workspace_hash_mismatch"
+    assert metadata["retry_downgrade_reason"] == "no_session_id"
 
 
 def test_write_retry_checkpoint_no_worktree_never_raises(tmp_path: Path) -> None:
