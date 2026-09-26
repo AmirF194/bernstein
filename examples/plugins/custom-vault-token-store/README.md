@@ -73,11 +73,12 @@ point this plugin at one.
 
 ## what gets recorded
 
-the token value itself never enters the grant chain. What
+the accessor, the lease identity, and the fact of revocation do enter the
+grant chain; only the raw token value is excluded. What
 `bernstein.core.identity.grants` records when this store issues a
-credential is the store id in the reference (`vault`), nothing else from
-this plugin. The `client_token`, its accessor, and its lease identity are
-held in the broker's in-process registry for the token's lifetime and are
+credential is the store id in the reference (`vault`) plus the accessor
+this store returns as `upstream_id`. The `client_token` itself is held
+only in the broker's in-process registry for the token's lifetime and is
 not written to disk by this plugin. The broker checks revocation only
 before a mint (the `report_revocation` call), so revoking an already
 issued token in Vault does not by itself re-check that token later.
