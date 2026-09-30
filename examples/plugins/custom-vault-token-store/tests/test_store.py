@@ -75,6 +75,57 @@ class TestResolve:
             store.resolve("bernstein-agent")
 
 
+class TestRoleNameValidation:
+    """A role name goes straight into the Vault request path unescaped.
+
+    ``vault:../../sys/policy``, or a role containing ``?``/``#``, changes
+    which Vault endpoint the request hits and carries the operator's
+    token, so every entry point that builds a path from it must reject
+    it before any transport call, not just the ones a happy-path test
+    would exercise.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../sys/policy", "a/../b", "role?extra=1", "role#frag", "role/with/slash", ".."],
+    )
+    def test_resolve_rejects_traversal_shaped_path(self, path: str) -> None:
+        def _unreachable(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise AssertionError("transport must not be called for an invalid role name")
+
+        store = VaultTokenRoleStore(transport=_unreachable)
+        with pytest.raises(ExternalStoreError, match="invalid vault role name"):
+            store.resolve(path)
+
+    def test_mint_credential_rejects_traversal_shaped_path(self) -> None:
+        def _unreachable(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise AssertionError("transport must not be called for an invalid role name")
+
+        store = VaultTokenRoleStore(transport=_unreachable)
+        with pytest.raises(ExternalStoreError, match="invalid vault role name"):
+            store.mint_credential("../sys/policy", audience="agent", ttl_seconds=60)
+
+    def test_report_revocation_rejects_traversal_shaped_path(self) -> None:
+        def _unreachable(_method: str, _path: str, _body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+            raise AssertionError("transport must not be called for an invalid role name")
+
+        store = VaultTokenRoleStore(transport=_unreachable)
+        with pytest.raises(ExternalStoreError, match="invalid vault role name"):
+            store.report_revocation("../sys/policy", upstream_id="../sys/policy")
+
+    def test_ordinary_role_name_is_accepted(self) -> None:
+        transport = _FakeTransport(
+            {
+                ("GET", "auth/token/roles/bernstein-agent.v2"): {
+                    "data": {"name": "bernstein-agent.v2", "token_explicit_max_ttl": 600},
+                },
+            }
+        )
+        store = VaultTokenRoleStore(transport=transport)
+        descriptor = store.resolve("bernstein-agent.v2")
+        assert descriptor.upstream_id == "bernstein-agent.v2"
+
+
 class TestMintCredential:
     def test_mint_returns_client_token_capped_to_requested_ttl(self) -> None:
         transport = _FakeTransport(
@@ -237,6 +288,18 @@ class TestPluginRegistration:
     def test_plugin_class_has_stable_name(self) -> None:
         assert VaultTokenStorePlugin.plugin_name == "custom-vault-token-store"
         assert VaultTokenStorePlugin.hook_target == "provide_secret_store"
+
+    def test_rejects_non_loopback_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BERNSTEIN_VAULT_ADDR", "http://vault.internal.example.com:8200")
+        monkeypatch.setenv("BERNSTEIN_VAULT_TOKEN", "roottoken")
+        with pytest.raises(ValueError, match="cleartext"):
+            VaultTokenStorePlugin().provide_secret_store()
+
+    def test_allows_https_to_a_remote_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BERNSTEIN_VAULT_ADDR", "https://vault.internal.example.com:8200")
+        monkeypatch.setenv("BERNSTEIN_VAULT_TOKEN", "roottoken")
+        registration = VaultTokenStorePlugin().provide_secret_store()
+        assert registration is not None
 
 
 class _BrokerFakeTransport:

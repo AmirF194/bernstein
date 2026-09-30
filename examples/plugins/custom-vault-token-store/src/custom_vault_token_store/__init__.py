@@ -23,7 +23,9 @@ registration that fails on first use.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+from urllib.parse import urlsplit
 
 from bernstein.core.security.secret_store_registry import SecretStoreRegistration
 from bernstein.plugins import hookimpl
@@ -42,6 +44,27 @@ __all__ = [
     "VaultTransport",
 ]
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback_http_addr(addr: str) -> bool:
+    """True unless this is a plain ``http://`` address to a non-loopback host.
+
+    ``https://`` is always fine, the transport encrypts the token either
+    way. Plain ``http://`` sends ``X-Vault-Token`` in cleartext, which is
+    only acceptable to a host that never leaves the machine.
+    """
+    parsed = urlsplit(addr)
+    if parsed.scheme != "http":
+        return True
+    host = parsed.hostname or ""
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 
 class VaultTokenStorePlugin:
     """Plugin entry point: advertises the ``vault`` secret store."""
@@ -55,6 +78,12 @@ class VaultTokenStorePlugin:
         token = os.environ.get("BERNSTEIN_VAULT_TOKEN", "")
         if not addr or not token:
             return None
+        if not _is_loopback_http_addr(addr):
+            raise ValueError(
+                f"BERNSTEIN_VAULT_ADDR={addr!r} is a plain http:// address to a "
+                "non-loopback host; that sends X-Vault-Token in cleartext over the "
+                "network. Use https:// or point it at a loopback address."
+            )
 
         def _factory(**_kwargs: object) -> VaultTokenRoleStore:
             return VaultTokenRoleStore(transport=VaultHttpTransport(addr=addr, token=token))

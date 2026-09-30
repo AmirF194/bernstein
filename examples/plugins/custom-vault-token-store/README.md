@@ -47,8 +47,9 @@ on first use).
 
 `BERNSTEIN_VAULT_ADDR` must use a loopback `http://` address (for example
 `http://127.0.0.1:8200`) or `https://`. A non-loopback `http://` address
-sends the `X-Vault-Token` header in cleartext on the network, so do not
-point this plugin at one.
+sends the `X-Vault-Token` header in cleartext on the network, and
+`provide_secret_store` raises `ValueError` rather than register against
+one.
 
 ## what it does
 

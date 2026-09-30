@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -111,6 +112,25 @@ class VaultHttpTransport:
             raise VaultHttpError(f"vault {method} {path} returned a non-JSON body") from exc
 
 
+_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _validate_role_name(path: str) -> str:
+    """Reject a role name that would change which Vault endpoint gets hit.
+
+    ``path`` goes straight into ``auth/token/roles/{path}`` and
+    ``auth/token/create/{path}``, both built with plain f-strings. A ref
+    like ``vault:../../sys/policy``, or a role containing ``?`` or ``#``,
+    changes the request path or query rather than naming a role, and the
+    request carries the operator's Vault token. ``..`` is rejected on top
+    of the character class since a role named e.g. ``a..b`` is not itself
+    a traversal but the class alone would still allow a bare ``..``.
+    """
+    if ".." in path or not _ROLE_NAME_RE.fullmatch(path):
+        raise ExternalStoreError(f"invalid vault role name {path!r}")
+    return path
+
+
 class VaultTokenRoleStore(ExternalSecretStore):
     """:class:`ExternalSecretStore` backed by a Vault token role.
 
@@ -129,6 +149,7 @@ class VaultTokenRoleStore(ExternalSecretStore):
         self._transport = transport
 
     def resolve(self, path: str) -> SecretDescriptor:
+        _validate_role_name(path)
         try:
             role = self._transport("GET", f"auth/token/roles/{path}")
         except VaultHttpError as exc:
@@ -147,6 +168,7 @@ class VaultTokenRoleStore(ExternalSecretStore):
         )
 
     def mint_credential(self, path: str, *, audience: str, ttl_seconds: int) -> ExternalCredential:
+        _validate_role_name(path)
         body = {"ttl": f"{ttl_seconds}s"}
         if audience:
             body["display_name"] = _sanitize_display_name(audience)
@@ -180,6 +202,7 @@ class VaultTokenRoleStore(ExternalSecretStore):
         return self._accessor_revoked(upstream_id)
 
     def _role_revoked(self, path: str) -> bool:
+        _validate_role_name(path)
         try:
             role = self._transport("GET", f"auth/token/roles/{path}")
         except VaultHttpError as exc:
